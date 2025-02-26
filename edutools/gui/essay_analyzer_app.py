@@ -4,22 +4,36 @@ import os
 import json
 import time
 import sys
+import threading
+import queue
 
 # 添加父目录到系统路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from edutools.core.essay.analyzer import EssayAnalyzer
+from edutools.core.config import Config
 
 class EssayAnalyzerApp:
+    TOOL_ID = "essay_analyzer"  # 工具唯一标识符
+    
     def __init__(self, root):
         self.root = root
         self.root.title("智能作文分析工具")
         self.root.geometry("1000x900")
         
-        # 配置参数
-        self.api_key = "your-api-key-here"  # 需要用户配置
-        self.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # 可选，用于配置不同的API端点
+        # 加载配置
+        self.config = Config()
+        openai_config = self.config.get_config('openai')
+        self.api_key = openai_config['api_key']
+        self.base_url = openai_config['api_base']
+        
+        # 初始化分析器
         self.analyzer = EssayAnalyzer(self.api_key, self.base_url)
-        self.base_dir = "作文记录"
+        
+        # 获取输出目录
+        self.base_dir = self.config.get_tool_output_path(self.TOOL_ID)
+        
+        # 用于异步处理的队列
+        self.result_queue = queue.Queue()
         
         # 创建界面组件
         self.create_widgets()
@@ -32,8 +46,12 @@ class EssayAnalyzerApp:
     def create_widgets(self):
         # 输入面板
         self.input_frame = ttk.LabelFrame(self.root, text="作文输入")
-        self.author_label = ttk.Label(self.input_frame, text="作者姓名:")
-        self.author_entry = ttk.Entry(self.input_frame, width=20)
+        
+        # 显示当前用户
+        self.user_frame = ttk.Frame(self.input_frame)
+        ttk.Label(self.user_frame, text="当前用户:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.user_frame, text=self.config.get_config('current_user'), font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT)
+        
         self.title_label = ttk.Label(self.input_frame, text="文章标题:")
         self.title_entry = ttk.Entry(self.input_frame, width=30)
         self.standard_label = ttk.Label(self.input_frame, text="评判标准:")
@@ -58,8 +76,17 @@ class EssayAnalyzerApp:
         self.analysis_text = tk.Text(self.analysis_frame, height=12, width=85, state=tk.DISABLED)
         self.analysis_text.configure(font=("微软雅黑", 11))
         
-        # 添加分析按钮
-        self.analyze_btn = ttk.Button(self.input_frame, text="开始分析", command=self.analyze_essay)
+        # 添加进度条
+        self.progress_frame = ttk.Frame(self.root)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.progress_frame, 
+                                          variable=self.progress_var,
+                                          maximum=100,
+                                          mode='indeterminate')
+        self.progress_label = ttk.Label(self.progress_frame, text="")
+        
+        # 分析按钮
+        self.analyze_btn = ttk.Button(self.input_frame, text="开始分析", command=self.start_analysis)
         
         # 状态栏
         self.status_var = tk.StringVar()
@@ -68,17 +95,16 @@ class EssayAnalyzerApp:
     def setup_layout(self):
         # 输入面板布局
         self.input_frame.pack(pady=10, fill=tk.X)
-        self.author_label.grid(row=0, column=0, padx=5, pady=2)
-        self.author_entry.grid(row=0, column=1, padx=5, pady=2)
-        self.title_label.grid(row=0, column=2, padx=5, pady=2)
-        self.title_entry.grid(row=0, column=3, padx=5, pady=2)
-        self.standard_label.grid(row=1, column=0, padx=5, pady=2)
-        self.standard_combo.grid(row=1, column=1, padx=5, pady=2)
-        self.custom_standard_entry.grid(row=1, column=3, padx=5, pady=2)
-        self.content_label.grid(row=2, column=0, padx=5, pady=2)
-        self.content_text.grid(row=3, column=0, columnspan=4, padx=5, pady=2)
-        self.open_file_btn.grid(row=4, column=0, padx=5, pady=5)
-        self.analyze_btn.grid(row=4, column=3, padx=5, pady=5)
+        self.user_frame.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=5)
+        self.title_label.grid(row=1, column=0, padx=5, pady=2)
+        self.title_entry.grid(row=1, column=1, padx=5, pady=2)
+        self.standard_label.grid(row=2, column=0, padx=5, pady=2)
+        self.standard_combo.grid(row=2, column=1, padx=5, pady=2)
+        self.custom_standard_entry.grid(row=2, column=2, padx=5, pady=2)
+        self.content_label.grid(row=3, column=0, padx=5, pady=2)
+        self.content_text.grid(row=4, column=0, columnspan=3, padx=5, pady=2)
+        self.open_file_btn.grid(row=5, column=0, padx=5, pady=5)
+        self.analyze_btn.grid(row=5, column=2, padx=5, pady=5)
         
         # 实时输出面板布局
         self.toggle_stream_btn.pack(pady=2)
@@ -89,6 +115,12 @@ class EssayAnalyzerApp:
         self.analysis_frame.pack(pady=5, fill=tk.BOTH, expand=True)
         self.score_label.pack(pady=5)
         self.analysis_text.pack(pady=5, fill=tk.BOTH, expand=True)
+        
+        # 进度条布局
+        self.progress_frame.pack(pady=5, fill=tk.X)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+        self.progress_label.pack(side=tk.LEFT, padx=10)
+        self.progress_frame.pack_forget()  # 初始时隐藏进度条
         
         # 状态栏
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -108,7 +140,7 @@ class EssayAnalyzerApp:
 
     def update_stream_text(self, text):
         self.stream_text.config(state=tk.NORMAL)
-        self.stream_text.insert(tk.END, text)
+        self.stream_text.insert(tk.END, text + "\n")  # 添加换行符使输出更清晰
         self.stream_text.see(tk.END)
         self.stream_text.config(state=tk.DISABLED)
         self.root.update()
@@ -118,34 +150,76 @@ class EssayAnalyzerApp:
         self.stream_text.delete(1.0, tk.END)
         self.stream_text.config(state=tk.DISABLED)
 
-    def analyze_essay(self):
+    def show_progress(self, show=True, text=""):
+        if show:
+            self.progress_frame.pack(pady=5, fill=tk.X)
+            self.progress_bar.start(10)  # 开始进度条动画
+            self.progress_label.config(text=text)
+            self.analyze_btn.config(state=tk.DISABLED)  # 禁用分析按钮
+        else:
+            self.progress_frame.pack_forget()
+            self.progress_bar.stop()  # 停止进度条动画
+            self.analyze_btn.config(state=tk.NORMAL)  # 启用分析按钮
+
+    def start_analysis(self):
         # 获取输入内容
-        author = self.author_entry.get().strip()
         title = self.title_entry.get().strip()
         content = self.content_text.get(1.0, tk.END).strip()
         standard = self.get_standard()
         
         # 输入验证
-        if not author or not content:
-            messagebox.showerror("错误", "作者姓名和作文内容不能为空")
+        if not content:
+            messagebox.showerror("错误", "作文内容不能为空")
             return
         
         # 清空实时输出
         self.clear_stream_text()
+        self.show_progress(True, "正在分析中...")
         self.status_var.set("正在分析中...")
-        self.root.update()
+        
+        # 在新线程中运行分析
+        threading.Thread(target=self.run_analysis,
+                       args=(content, title, standard),
+                       daemon=True).start()
+        
+        # 启动结果检查
+        self.root.after(100, self.check_result)
 
+    def run_analysis(self, content, title, standard):
         try:
-            result = self.analyzer.analyze_essay(content, title, standard)
-            self.show_analysis(result)
-            self.save_record(author, title, content, result)
-            # 分析完成后自动折叠思考过程面板
-            self.root.after(1000, self.toggle_stream)
+            def update_callback(message):
+                # 使用 after 方法在主线程中更新 UI
+                self.root.after(0, self.update_stream_text, message)
             
+            result = self.analyzer.analyze_essay(content, title, standard, callback=update_callback)
+            self.result_queue.put(("success", result, title, content))
         except Exception as e:
-            messagebox.showerror("API错误", f"分析失败: {str(e)}")
-        finally:
-            self.status_var.set("就绪")
+            self.result_queue.put(("error", str(e)))
+
+    def check_result(self):
+        try:
+            if not self.result_queue.empty():
+                status, *data = self.result_queue.get_nowait()
+                if status == "success":
+                    result, title, content = data
+                    self.show_analysis(result)
+                    self.save_record(title, content, result)
+                    self.show_progress(False)
+                    self.status_var.set("分析完成")
+                    # 分析完成后自动折叠思考过程面板
+                    self.root.after(1000, self.toggle_stream)
+                else:
+                    error_msg = data[0]
+                    self.show_progress(False)
+                    messagebox.showerror("API错误", f"分析失败: {error_msg}")
+                    self.status_var.set("分析失败")
+            else:
+                # 继续检查结果
+                self.root.after(100, self.check_result)
+        except Exception as e:
+            self.show_progress(False)
+            messagebox.showerror("错误", f"处理结果时出错: {str(e)}")
+            self.status_var.set("处理失败")
 
     def toggle_stream(self):
         if self.is_stream_collapsed:
@@ -171,12 +245,7 @@ class EssayAnalyzerApp:
         self.analysis_text.insert(tk.END, analysis_str)
         self.analysis_text.config(state=tk.DISABLED)
 
-    def save_record(self, author, title, content, result):
-        # 创建作者目录
-        author_dir = os.path.join(self.base_dir, author)
-        if not os.path.exists(author_dir):
-            os.makedirs(author_dir)
-        
+    def save_record(self, title, content, result):
         # 生成文件名
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         safe_title = "".join([c if c.isalnum() else "_" for c in title])
@@ -185,7 +254,7 @@ class EssayAnalyzerApp:
         # 保存记录
         record = {
             "meta": {
-                "author": author,
+                "user": self.config.get_config('current_user'),
                 "title": title,
                 "timestamp": timestamp,
                 "score": result["score"]
@@ -194,7 +263,7 @@ class EssayAnalyzerApp:
             "analysis": result
         }
         
-        with open(os.path.join(author_dir, filename), 'w', encoding='utf-8') as f:
+        with open(os.path.join(self.base_dir, filename), 'w', encoding='utf-8') as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
 
 def main():
